@@ -1,0 +1,23 @@
+{
+  "name": "agentic-devops-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Portable web application for validating an agentic development and CI/CD workflow.",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.4.1",
+    "ejs": "^3.1.10",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "supertest": "^7.1.4"
+  }
+}
