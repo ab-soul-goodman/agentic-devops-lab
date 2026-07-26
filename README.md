@@ -42,6 +42,14 @@ Run the automated test suite:
 npm test
 ```
 
+## CI
+
+CI runs for pull requests targeting `main`, pushes to `main`, and manual
+workflow dispatches. It installs dependencies with `npm ci` and runs the
+complete test suite with `npm test`.
+
+Successful CI will later become mandatory for merging into `main`.
+
 ## Endpoints
 
 - `GET /` renders an HTML page containing `Hello World`.
