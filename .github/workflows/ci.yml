@@ -40,3 +40,9 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+      - name: Validate Docker Compose configuration
+        run: docker compose config --quiet
+
+      - name: Build Docker image
+        run: docker build --tag agentic-devops-lab:${{ github.sha }} .

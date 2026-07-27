@@ -42,11 +42,73 @@ Run the automated test suite:
 npm test
 ```
 
+## Docker
+
+Build the application image:
+
+```sh
+docker compose build
+```
+
+Start the application in the background:
+
+```sh
+docker compose up -d
+```
+
+The application is available at `http://localhost:3000`. Set `APP_PORT` to
+publish it on a different host port:
+
+```sh
+APP_PORT=8080 docker compose up -d
+```
+
+Check the container status:
+
+```sh
+docker compose ps
+```
+
+Verify the application health endpoint:
+
+```sh
+curl -fsS http://localhost:3000/health
+```
+
+View the application logs:
+
+```sh
+docker compose logs
+```
+
+Stop and remove the application containers:
+
+```sh
+docker compose down
+```
+
+Compose stores the SQLite database in the named `app-data` volume. Running
+`docker compose down` removes the containers but preserves this volume and its
+database. Running `docker compose down -v` also deletes the volume and the
+database; do not use it without a backup.
+
+To run the image without Compose:
+
+```sh
+docker build -t agentic-devops-lab .
+docker run --rm -p 3000:3000 -v agentic-devops-data:/app/data \
+  agentic-devops-lab
+```
+
+The container runs as an unprivileged user and reports its status through the
+`GET /health` endpoint.
+
 ## CI
 
 CI runs for pull requests targeting `main`, pushes to `main`, and manual
-workflow dispatches. It installs dependencies with `npm ci` and runs the
-complete test suite with `npm test`.
+workflow dispatches. The `Test` check installs dependencies with `npm ci`, runs
+the complete test suite with `npm test`, validates the Docker Compose
+configuration, and builds the production Docker image.
 
 Successful CI will later become mandatory for merging into `main`.
 
