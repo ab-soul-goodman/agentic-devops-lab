@@ -13,8 +13,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -46,3 +46,349 @@ jobs:
 
       - name: Build Docker image
         run: docker build --tag agentic-devops-lab:${{ github.sha }} .
+
+  publish:
+    name: Publish
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: ghcr-immutable-${{ github.sha }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository }}
+    outputs:
+      digest: ${{ steps.artifact.outputs.digest }}
+      artifact_status: ${{ steps.artifact.outputs.status }}
+      verification_result: ${{ steps.verify.outputs.result }}
+      deployable_reference: ${{ steps.artifact.outputs.reference }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check immutable SHA tag
+        id: immutable
+        env:
+          SHA_REFERENCE: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+
+          inspection_error="${RUNNER_TEMP}/immutable-inspect-error.txt"
+          if digest="$(docker buildx imagetools inspect \
+            "${SHA_REFERENCE}" \
+            --format '{{ .Manifest.Digest }}' \
+            2>"${inspection_error}")"; then
+            if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "Registry returned an invalid digest for ${SHA_REFERENCE}" >&2
+              exit 1
+            fi
+
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+            echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          elif grep -Eqi \
+            '(manifest unknown|name unknown|not found|no such manifest)' \
+            "${inspection_error}"; then
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+            echo "digest=" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Unable to determine whether ${SHA_REFERENCE} exists." >&2
+            cat "${inspection_error}" >&2
+            exit 1
+          fi
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ github.sha }},priority=1000
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created={{commit_date 'YYYY-MM-DDTHH:mm:ss.SSS[Z]'}}
+
+      - name: Build and publish missing SHA artifact
+        id: build
+        if: steps.immutable.outputs.exists == 'false'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Resolve immutable artifact digest
+        id: artifact
+        env:
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+          EXISTING_DIGEST: ${{ steps.immutable.outputs.digest }}
+          TAG_EXISTED: ${{ steps.immutable.outputs.exists }}
+        run: |
+          set -Eeuo pipefail
+
+          if [ "${TAG_EXISTED}" = true ]; then
+            artifact_status=existing
+            digest="${EXISTING_DIGEST}"
+          else
+            artifact_status=published
+            digest="${BUILT_DIGEST}"
+          fi
+
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "No valid immutable artifact digest was resolved." >&2
+            exit 1
+          fi
+
+          resolved_digest="$(docker buildx imagetools inspect \
+            "${IMAGE_NAME}:${GITHUB_SHA}" \
+            --format '{{ .Manifest.Digest }}')"
+          if [ "${resolved_digest}" != "${digest}" ]; then
+            echo "SHA tag digest does not match the selected artifact digest." >&2
+            exit 1
+          fi
+
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          echo "status=${artifact_status}" >> "${GITHUB_OUTPUT}"
+          echo "reference=${IMAGE_NAME}@${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify published image by digest
+        id: verify
+        env:
+          IMAGE_DIGEST: ${{ steps.artifact.outputs.digest }}
+          EXPECTED_SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+
+          image_reference="${IMAGE_NAME}@${IMAGE_DIGEST}"
+          container_name="dev004-verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          volume_name="dev004-verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          verification_result=failed
+          container_created=false
+          volume_created=false
+
+          cleanup() {
+            if [ "${container_created}" = true ]; then
+              docker rm --force "${container_name}" >/dev/null 2>&1 || true
+            fi
+            if [ "${volume_created}" = true ]; then
+              docker volume rm "${volume_name}" >/dev/null 2>&1 || true
+            fi
+            echo "result=${verification_result}" >> "${GITHUB_OUTPUT}"
+          }
+          trap cleanup EXIT
+
+          docker pull "${image_reference}"
+
+          source_label="$(docker image inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' \
+            "${image_reference}")"
+          revision_label="$(docker image inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+            "${image_reference}")"
+          created_label="$(docker image inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.created" }}' \
+            "${image_reference}")"
+
+          test "${source_label}" = "${EXPECTED_SOURCE}"
+          test "${revision_label}" = "${EXPECTED_REVISION}"
+          test -n "${created_label}"
+
+          configured_user="$(docker image inspect \
+            --format '{{ .Config.User }}' \
+            "${image_reference}")"
+          test "${configured_user}" = node
+
+          runtime_uid="$(docker run --rm --entrypoint id "${image_reference}" -u)"
+          test "${runtime_uid}" = 1000
+
+          if docker container inspect "${container_name}" >/dev/null 2>&1; then
+            echo "Verification container already exists: ${container_name}" >&2
+            exit 1
+          fi
+          if docker volume inspect "${volume_name}" >/dev/null 2>&1; then
+            echo "Verification volume already exists: ${volume_name}" >&2
+            exit 1
+          fi
+
+          docker volume create "${volume_name}" >/dev/null
+          volume_created=true
+          container_created=true
+          docker run \
+            --detach \
+            --name "${container_name}" \
+            --volume "${volume_name}:/app/data" \
+            "${image_reference}" >/dev/null
+
+          health_status=starting
+          for attempt in $(seq 1 60); do
+            health_status="$(docker inspect \
+              --format '{{ if .State.Health }}{{ .State.Health.Status }}{{ else }}missing{{ end }}' \
+              "${container_name}")"
+            if [ "${health_status}" = healthy ]; then
+              break
+            fi
+            if [ "$(docker inspect --format '{{ .State.Running }}' "${container_name}")" != true ]; then
+              docker logs "${container_name}"
+              exit 1
+            fi
+            sleep 2
+          done
+          test "${health_status}" = healthy
+
+          health_body="$(docker exec "${container_name}" node -e '
+            const http = require("node:http");
+            const request = http.get(
+              { host: "127.0.0.1", port: 3000, path: "/health" },
+              (response) => {
+                let body = "";
+                response.setEncoding("utf8");
+                response.on("data", (chunk) => { body += chunk; });
+                response.on("end", () => {
+                  if (response.statusCode !== 200) process.exit(1);
+                  process.stdout.write(body);
+                });
+              }
+            );
+            request.on("error", () => process.exit(1));
+          ')"
+          test "${health_body}" = '{"status":"ok"}'
+
+          docker exec "${container_name}" node -e '
+            const http = require("node:http");
+            const request = http.get(
+              { host: "127.0.0.1", port: 3000, path: "/" },
+              (response) => {
+                let body = "";
+                response.setEncoding("utf8");
+                response.on("data", (chunk) => { body += chunk; });
+                response.on("end", () => {
+                  if (response.statusCode !== 200 || !body.includes("Hello World")) {
+                    process.exit(1);
+                  }
+                });
+              }
+            );
+            request.on("error", () => process.exit(1));
+          '
+
+          docker exec "${container_name}" node -e '
+            require("node:fs").accessSync("/app/data/app.sqlite");
+          '
+
+          verification_result=passed
+
+  promote:
+    name: Promote
+    needs: publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ghcr-main-promotion
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository }}
+      IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote verified digest to main
+        id: promote
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+
+          promotion_status=skipped
+          promotion_reason="promotion did not complete"
+
+          write_outputs() {
+            echo "status=${promotion_status}" >> "${GITHUB_OUTPUT}"
+            echo "reason=${promotion_reason}" >> "${GITHUB_OUTPUT}"
+          }
+          trap write_outputs EXIT
+
+          current_main_sha="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" \
+            --jq '.object.sha')"
+
+          if [ "${current_main_sha}" != "${GITHUB_SHA}" ]; then
+            promotion_reason="refs/heads/main points to ${current_main_sha}; this run is ${GITHUB_SHA}"
+            exit 0
+          fi
+
+          docker buildx imagetools create \
+            --prefer-index=false \
+            --tag "${IMAGE_NAME}:main" \
+            "${IMAGE_NAME}@${IMAGE_DIGEST}"
+
+          promoted_digest="$(docker buildx imagetools inspect \
+            "${IMAGE_NAME}:main" \
+            --format '{{ .Manifest.Digest }}')"
+          if [ "${promoted_digest}" != "${IMAGE_DIGEST}" ]; then
+            echo "The main tag does not resolve to the verified digest." >&2
+            exit 1
+          fi
+
+          promotion_status=updated
+          promotion_reason="GITHUB_SHA is the current refs/heads/main and its verified digest was promoted"
+
+      - name: Write publication summary
+        if: always()
+        env:
+          ARTIFACT_STATUS: ${{ needs.publish.outputs.artifact_status }}
+          DEPLOYABLE_REFERENCE: ${{ needs.publish.outputs.deployable_reference }}
+          PROMOTION_REASON: ${{ steps.promote.outputs.reason || 'digest verification or promotion did not complete' }}
+          PROMOTION_STATUS: ${{ steps.promote.outputs.status || 'skipped' }}
+          VERIFICATION_RESULT: ${{ needs.publish.outputs.verification_result }}
+        run: |
+          {
+            echo "## GHCR publication"
+            echo
+            echo "- Git commit SHA: \`${GITHUB_SHA}\`"
+            echo "- Immutable SHA tag: \`${IMAGE_NAME}:${GITHUB_SHA}\`"
+            echo "- Digest: \`${IMAGE_DIGEST}\`"
+            echo "- Artifact status: **${ARTIFACT_STATUS}**"
+            echo "- Digest verification result: **${VERIFICATION_RESULT}**"
+            echo "- Main tag promotion: **${PROMOTION_STATUS}**"
+            echo "- Main promotion reason: ${PROMOTION_REASON}"
+            echo "- Deployable reference: \`${DEPLOYABLE_REFERENCE}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
